@@ -27,7 +27,7 @@ Extensions live in `extensions/`. They're TypeScript files (or directories with 
 | **quick-review** | Command (`/quick-review`) | *(mine)* Code review for bugs, security issues, and error handling gaps with optional model switching |
 | **review** | Command (`/review`) | Full code review extension supporting GitHub PRs, branch diffs, uncommitted changes, and specific commits |
 | **split-fork** | Tool | Opens a new terminal split/pane (Ghostty, tmux) running a separate Pi session |
-| **stream-output** | Flags (`--stream`, `--stream-output`) | Streams thinking, text, tool content, or status-only liveness events to stderr by default, with opt-in stdout or file targets for programmatic consumption |
+| **stream-output** | Flags (`--stream`, `--stream-output`, `--usage-output`) | Streams thinking, text, tool content, or status-only liveness events, and can write provider usage JSON for programmatic consumption |
 | **system-manager** | Command (`/system`) | Enable/disable skills, extensions, utils, and root config files via symlink management between `agent-git/` and `agent/` |
 | **todos** | Tool + Command (`/todos`) | File-based todo management (`.pi/todos/`) with lock-based concurrency for multi-session use |
 | **tools** | Command (`/tools`) | Interactive tool selector to enable/disable tools with persistence across sessions |
@@ -44,9 +44,12 @@ Useful patterns:
 pi -p --stream=status --stream-output=file --stream-file=/tmp/pi-progress.log "review this diff"
 pi -p --stream=message,status --stream-no-ansi=true "review this diff"
 pi -p --stream=message --stream-output=stdout "terminal-only streaming"
+pi -p --usage-output=file --usage-file=/tmp/pi-usage.json "review this diff"
 ```
 
 `--stream-output=stdout` is intentionally opt-in because it mixes streamed prefixes with the final `pi -p` answer on stdout.
+
+`--usage-output=file` writes a compact JSON object from the last assistant message's provider usage fields. The extractor is provider-agnostic first: it understands Pi's current `input`/`output`/`cacheRead`/`cacheWrite` shape and common provider variants such as `inputTokens`, `outputTokens`, and token detail objects. If a provider does not expose numeric usage, the JSON says `available: false` with the checked surfaces and reason instead of inventing zeros.
 
 Use `--stream-no-ansi=true` when the flag appears before the prompt; Pi parses extension flags before it knows their registered types, so the explicit value avoids consuming the prompt as a flag value.
 
