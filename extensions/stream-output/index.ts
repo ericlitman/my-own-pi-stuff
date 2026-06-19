@@ -1,8 +1,8 @@
 /**
  * Stream Output Extension
  *
- * Adds --stream flag that outputs thinking, text, and tool content with formatting:
- * - All output goes to stderr
+ * Adds --stream flag that outputs thinking, text, status, and tool content with formatting:
+ * - Stream output defaults to stderr, with opt-in stdout or file targets
  * - [thinking] prefix in gray
  * - [text] prefix in cyan
  * - [tool] prefix in yellow (shows tool name, args, and results)
@@ -14,26 +14,225 @@
  *   message   - Stream LLM response text
  *   thinking  - Stream LLM thinking text
  *   tools     - Stream tool calls and results
+ *   status    - Stream non-sensitive liveness events and counts
  *   all       - Stream everything (shorthand for message,thinking,tools)
+ *   on/true   - Stream message text (safe shorthand)
  *
  * Examples:
  *   pi -p --stream=all "write me a poem"                         # all output to stderr
  *   pi -p --stream=message,thinking "explain recursion"          # text + thinking
+ *   pi -p --stream=status "review this code"                     # liveness only, no text/thinking
+ *   pi -p --stream=message,status "review this code"             # text + progress counts
  *   pi -p --stream=tools "write me a poem"                      # tool calls only
  *   pi -p --stream=all "write me a poem" 2>/dev/null             # suppress all
  *   pi -p --stream=all "write me a poem" 1>/dev/null             # text only (from stderr)
+ *   pi -p --stream=status --stream-output=file --stream-file=/tmp/pi-progress.log "review"
+ *   pi -p --stream=message --stream-output=stdout "terminal-only streaming"
+ *   pi -p --stream=message --stream-no-ansi=true "plain log output"
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { closeSync, openSync, writeFileSync, writeSync } from "node:fs";
+import type { AgentEndEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // ANSI color codes
 const colors = {
 	gray: "\x1b[90m",
 	cyan: "\x1b[36m",
 	yellow: "\x1b[33m",
+	green: "\x1b[32m",
 	red: "\x1b[31m",
 	reset: "\x1b[0m",
 };
+
+const emptyColors = {
+	gray: "",
+	cyan: "",
+	yellow: "",
+	green: "",
+	red: "",
+	reset: "",
+};
+
+const STATUS_INTERVAL_MS = 5000;
+const STATUS_DELTA_CHARS = 1000;
+type StreamOutputTarget = "stderr" | "stdout" | "file";
+type UsageOutputTarget = "off" | "stderr" | "stdout" | "file";
+
+type UsageNumbers = {
+	inputTokens: number | null;
+	outputTokens: number | null;
+	cacheReadTokens: number | null;
+	cacheWriteTokens: number | null;
+	reasoningOutputTokens: number | null;
+	totalTokens: number | null;
+	totalCostUsd: number | null;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function finiteNumber(value: unknown): number | null {
+	if (typeof value === "number") return Number.isFinite(value) ? value : null;
+	if (typeof value === "string" && value.trim() !== "") {
+		const parsed = Number(value);
+		return Number.isFinite(parsed) ? parsed : null;
+	}
+	return null;
+}
+
+function firstFinite(values: unknown[]): number | null {
+	for (const value of values) {
+		const n = finiteNumber(value);
+		if (n !== null) return n;
+	}
+	return null;
+}
+
+function getPath(root: unknown, path: string[]): unknown {
+	let current = root;
+	for (const part of path) {
+		if (!isRecord(current)) return undefined;
+		current = current[part];
+	}
+	return current;
+}
+
+function valuesAt(root: unknown, paths: string[][]): unknown[] {
+	return paths.map((path) => getPath(root, path));
+}
+
+function costTotal(usage: unknown): number | null {
+	return firstFinite([
+		getPath(usage, ["cost"]),
+		getPath(usage, ["cost", "total"]),
+		getPath(usage, ["cost", "totalUsd"]),
+		getPath(usage, ["cost", "usd"]),
+		getPath(usage, ["costUsd"]),
+		getPath(usage, ["totalCostUsd"]),
+		getPath(usage, ["total_cost_usd"]),
+		getPath(usage, ["totalCost"]),
+		getPath(usage, ["total_cost"]),
+	]);
+}
+
+function sumKnownTokens(numbers: UsageNumbers): number | null {
+	const parts = [
+		numbers.inputTokens,
+		numbers.outputTokens,
+		numbers.cacheReadTokens,
+		numbers.cacheWriteTokens,
+		numbers.reasoningOutputTokens,
+	].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+	return parts.length > 0 ? parts.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function normalizeUsageNumbers(usage: unknown): UsageNumbers {
+	const numbers: UsageNumbers = {
+		inputTokens: firstFinite(valuesAt(usage, [
+			["input"],
+			["inputTokens"],
+			["input_tokens"],
+			["promptTokens"],
+			["prompt_tokens"],
+			["usage", "input_tokens"],
+			["inputTokenDetails", "noCacheTokens"],
+		])),
+		outputTokens: firstFinite(valuesAt(usage, [
+			["output"],
+			["outputTokens"],
+			["output_tokens"],
+			["completionTokens"],
+			["completion_tokens"],
+			["usage", "output_tokens"],
+		])),
+		cacheReadTokens: firstFinite(valuesAt(usage, [
+			["cacheRead"],
+			["cacheReadTokens"],
+			["cache_read_tokens"],
+			["cacheReadInputTokens"],
+			["cache_read_input_tokens"],
+			["inputTokenDetails", "cacheReadTokens"],
+		])),
+		cacheWriteTokens: firstFinite(valuesAt(usage, [
+			["cacheWrite"],
+			["cacheWriteTokens"],
+			["cache_write_tokens"],
+			["cacheCreationInputTokens"],
+			["cache_creation_input_tokens"],
+			["inputTokenDetails", "cacheWriteTokens"],
+		])),
+		reasoningOutputTokens: firstFinite(valuesAt(usage, [
+			["reasoningOutputTokens"],
+			["reasoning_output_tokens"],
+			["thinkingTokens"],
+			["thinking_tokens"],
+			["outputTokenDetails", "reasoningTokens"],
+		])),
+		totalTokens: firstFinite(valuesAt(usage, [
+			["totalTokens"],
+			["total_tokens"],
+			["total"],
+			["usage", "total_tokens"],
+		])),
+		totalCostUsd: costTotal(usage),
+	};
+	if (numbers.totalTokens === null) numbers.totalTokens = sumKnownTokens(numbers);
+	return numbers;
+}
+
+function hasUsageNumbers(numbers: UsageNumbers): boolean {
+	return Object.values(numbers).some((value) => typeof value === "number" && Number.isFinite(value));
+}
+
+function lastAssistantMessage(event: AgentEndEvent): Record<string, unknown> | null {
+	for (let i = event.messages.length - 1; i >= 0; i--) {
+		const message = event.messages[i];
+		if (isRecord(message) && message.role === "assistant") return message;
+	}
+	return null;
+}
+
+function buildUsageSnapshot(event: AgentEndEvent): Record<string, unknown> {
+	const assistant = lastAssistantMessage(event);
+	const assistantCount = event.messages.filter((message) => isRecord(message) && message.role === "assistant").length;
+	const usage = assistant?.usage;
+	const numbers = normalizeUsageNumbers(usage);
+	const usageKeys = isRecord(usage) ? Object.keys(usage).sort() : [];
+	const available = hasUsageNumbers(numbers);
+
+	return {
+		schema: "pi.usage-output.v1",
+		schema_version: 1,
+		available,
+		usage_source: "pi.agent_end.messages.last_assistant.usage",
+		extraction_mechanism: "provider_agnostic_usage_fields_v1",
+		provider_usage_mechanism: typeof assistant?.provider === "string"
+			? `${assistant.provider}.assistant_message.usage`
+			: "assistant_message.usage",
+		checked_surfaces: ["agent_end.messages", "last_assistant_message.usage"],
+		assistant_messages: assistantCount,
+		provider: typeof assistant?.provider === "string" ? assistant.provider : null,
+		model: typeof assistant?.model === "string" ? assistant.model : null,
+		response_model: typeof assistant?.responseModel === "string" ? assistant.responseModel : null,
+		api: typeof assistant?.api === "string" ? assistant.api : null,
+		stop_reason: typeof assistant?.stopReason === "string" ? assistant.stopReason : null,
+		usage_shape: usageKeys.length > 0 ? usageKeys.join(",") : null,
+		raw_usage_keys: usageKeys,
+		input_tokens: numbers.inputTokens,
+		output_tokens: numbers.outputTokens,
+		cache_read_tokens: numbers.cacheReadTokens,
+		cache_write_tokens: numbers.cacheWriteTokens,
+		reasoning_output_tokens: numbers.reasoningOutputTokens,
+		total_tokens: numbers.totalTokens,
+		total_cost_usd: numbers.totalCostUsd,
+		unavailable_reason: available
+			? null
+			: usage === undefined
+				? "missing_assistant_message_usage"
+				: "assistant_message_usage_has_no_numeric_tokens_or_cost",
+	};
+}
 
 // ── Helpers for parsing tool args/results ──────────────────────────────
 
@@ -174,31 +373,253 @@ function indentContent(text: string, indent: number): string {
 
 export default function streamOutputExtension(pi: ExtensionAPI): void {
 	pi.registerFlag("stream", {
-		description: "Stream output to stderr. Comma-separated values: message, thinking, tools, all",
+		description: "Stream output. Comma-separated values: message, thinking, tools, status, all",
 		type: "string",
 		default: "off",
 	});
+	pi.registerFlag("stream-no-ansi", {
+		description: "Disable ANSI colors and terminal cleanup for --stream output",
+		type: "boolean",
+		default: false,
+	});
+	pi.registerFlag("stream-output", {
+		description: "Where to write streamed output: stderr, stdout, or file",
+		type: "string",
+		default: "stderr",
+	});
+	pi.registerFlag("stream-file", {
+		description: "Path to append streamed output when --stream-output=file",
+		type: "string",
+		default: "",
+	});
+	pi.registerFlag("usage-output", {
+		description: "Where to write provider usage JSON: off, stderr, stdout, or file",
+		type: "string",
+		default: "off",
+	});
+	pi.registerFlag("usage-file", {
+		description: "Path to write provider usage JSON when --usage-output=file",
+		type: "string",
+		default: "",
+	});
 
-	type StreamOption = "message" | "thinking" | "tools";
+	type StreamOption = "message" | "thinking" | "tools" | "status";
+
+	let warnedInvalidStreamFlag = "";
+	let warnedInvalidOutputFlag = "";
+	let warnedInvalidUsageOutputFlag = "";
+	let warnedMissingStreamFile = false;
+	let warnedMissingUsageFile = false;
+	let warnedFileWriteError = "";
+	let warnedUsageFileWriteError = "";
+	let outputFileFd: number | undefined;
+	let outputFilePath = "";
+
+	function writeStderr(text: string): void {
+		writeSync(2, text);
+	}
+
+	function getStreamOutputTarget(): StreamOutputTarget {
+		const raw = String(pi.getFlag("stream-output") || "stderr").trim().toLowerCase();
+		if (raw === "stderr" || raw === "stdout" || raw === "file") return raw;
+		if (warnedInvalidOutputFlag !== raw) {
+			warnedInvalidOutputFlag = raw;
+			writeStderr(`[stream-output] unknown --stream-output value "${raw}", using stderr\n`);
+		}
+		return "stderr";
+	}
+
+	function getStreamFilePath(): string {
+		const value = pi.getFlag("stream-file");
+		return typeof value === "string" ? value.trim() : "";
+	}
+
+	function getUsageOutputTarget(): UsageOutputTarget {
+		const raw = String(pi.getFlag("usage-output") || "off").trim().toLowerCase();
+		if (raw === "off" || raw === "false" || raw === "none") return "off";
+		if (raw === "stderr" || raw === "stdout" || raw === "file") return raw;
+		if (warnedInvalidUsageOutputFlag !== raw) {
+			warnedInvalidUsageOutputFlag = raw;
+			writeStderr(`[stream-output] unknown --usage-output value "${raw}", usage output disabled\n`);
+		}
+		return "off";
+	}
+
+	function getUsageFilePath(): string {
+		const value = pi.getFlag("usage-file");
+		return typeof value === "string" ? value.trim() : "";
+	}
+
+	function closeOutputFile(): void {
+		if (outputFileFd === undefined) return;
+		const fd = outputFileFd;
+		outputFileFd = undefined;
+		outputFilePath = "";
+		closeSync(fd);
+	}
+
+	function getOutputFileFd(path: string): number | undefined {
+		if (outputFileFd !== undefined && outputFilePath === path) return outputFileFd;
+		closeOutputFile();
+		try {
+			outputFileFd = openSync(path, "a");
+			outputFilePath = path;
+			warnedFileWriteError = "";
+			return outputFileFd;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const key = `${path}:${message}`;
+			if (warnedFileWriteError !== key) {
+				warnedFileWriteError = key;
+				writeStderr(`[stream-output] could not open --stream-file "${path}": ${message}; using stderr\n`);
+			}
+			return undefined;
+		}
+	}
+
+	function writeOutput(text: string): void {
+		const target = getStreamOutputTarget();
+		if (target === "stdout") {
+			// Pi print/json modes guard process.stdout.write; raw fd writes make
+			// stdout opt-in explicit and predictable.
+			writeSync(1, text);
+			return;
+		}
+		if (target === "file") {
+			const path = getStreamFilePath();
+			if (!path) {
+				if (!warnedMissingStreamFile) {
+					warnedMissingStreamFile = true;
+					writeStderr("[stream-output] --stream-output=file requires --stream-file=<path>; using stderr\n");
+				}
+				writeStderr(text);
+				return;
+			}
+			const fd = getOutputFileFd(path);
+			if (fd === undefined) {
+				writeStderr(text);
+				return;
+			}
+			writeSync(fd, text);
+			return;
+		}
+		writeStderr(text);
+	}
+
+	function writeUsageOutput(event: AgentEndEvent): void {
+		const target = getUsageOutputTarget();
+		if (target === "off") return;
+		const line = `${JSON.stringify(buildUsageSnapshot(event))}\n`;
+		if (target === "stdout") {
+			writeSync(1, line);
+			return;
+		}
+		if (target === "stderr") {
+			writeStderr(line);
+			return;
+		}
+		const path = getUsageFilePath();
+		if (!path) {
+			if (!warnedMissingUsageFile) {
+				warnedMissingUsageFile = true;
+				writeStderr("[stream-output] --usage-output=file requires --usage-file=<path>; usage output disabled\n");
+			}
+			return;
+		}
+		try {
+			writeFileSync(path, line, "utf8");
+			warnedUsageFileWriteError = "";
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const key = `${path}:${message}`;
+			if (warnedUsageFileWriteError !== key) {
+				warnedUsageFileWriteError = key;
+				writeStderr(`[stream-output] could not write --usage-file "${path}": ${message}\n`);
+			}
+		}
+	}
+
+	function useAnsi(): boolean {
+		if (pi.getFlag("stream-no-ansi") === true) return false;
+		const target = getStreamOutputTarget();
+		if (target === "stderr") return process.stderr.isTTY === true;
+		if (target === "stdout") return process.stdout.isTTY === true;
+		return false;
+	}
+
+	function palette(): typeof colors {
+		return useAnsi() ? colors : emptyColors;
+	}
+
+	function timestamp(): string {
+		return new Date().toISOString();
+	}
+
+	function writeStatus(message: string): void {
+		const c = palette();
+		writeOutput(`${c.green}[status] ${timestamp()} ${message}${c.reset}\n`);
+	}
+
+	function maybeWarnInvalidStreamValues(invalid: string[], flag: string): void {
+		if (invalid.length === 0 || warnedInvalidStreamFlag === flag) return;
+		warnedInvalidStreamFlag = flag;
+		const c = palette();
+		writeOutput(
+			`${c.yellow}[stream-output] ignoring unknown --stream value${invalid.length === 1 ? "" : "s"}: ${invalid.join(", ")}${c.reset}\n`,
+		);
+	}
 
 	function getStreamOptions(): Set<StreamOption> {
 		const flag = pi.getFlag("stream");
-		if (!flag || flag === "off") return new Set();
+		if (!flag || flag === "off" || flag === false) return new Set();
 
-		const parts = flag.split(",").map((s) => s.trim().toLowerCase());
+		const rawFlag = String(flag);
+		const parts = rawFlag.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+		const valid: StreamOption[] = ["message", "thinking", "tools", "status"];
+		const opts = new Set<StreamOption>();
+		const invalid: string[] = [];
 
-		if (parts.includes("all")) {
-			return new Set<StreamOption>(["message", "thinking", "tools"]);
+		for (const part of parts) {
+			if (part === "all") {
+				opts.add("message");
+				opts.add("thinking");
+				opts.add("tools");
+			} else if (part === "on" || part === "true") {
+				opts.add("message");
+			} else if (valid.includes(part as StreamOption)) {
+				opts.add(part as StreamOption);
+			} else {
+				invalid.push(part);
+			}
 		}
 
-		const valid: StreamOption[] = ["message", "thinking", "tools"];
-		return new Set<StreamOption>(parts.filter((p): p is StreamOption => valid.includes(p as StreamOption)));
+		maybeWarnInvalidStreamValues(invalid, rawFlag);
+		return opts;
 	}
 
 	let inThinkingBlock = false;
 	let inTextBlock = false;
-	let streamedText = "";
 	let textLines = 0;
+	let textChars = 0;
+	let thinkingChars = 0;
+	let lastStatusAt = 0;
+	let lastStatusTextChars = 0;
+	let lastStatusThinkingChars = 0;
+
+	function maybeWriteCountStatus(kind: "message" | "thinking"): void {
+		const opts = getStreamOptions();
+		if (!opts.has("status")) return;
+
+		const now = Date.now();
+		const chars = kind === "message" ? textChars : thinkingChars;
+		const lastChars = kind === "message" ? lastStatusTextChars : lastStatusThinkingChars;
+		if (now - lastStatusAt < STATUS_INTERVAL_MS && chars - lastChars < STATUS_DELTA_CHARS) return;
+
+		lastStatusAt = now;
+		if (kind === "message") lastStatusTextChars = chars;
+		else lastStatusThinkingChars = chars;
+		writeStatus(`${kind} streaming: ${chars} chars`);
+	}
 
 	pi.on("message_update", async (event) => {
 		const opts = getStreamOptions();
@@ -206,38 +627,45 @@ export default function streamOutputExtension(pi: ExtensionAPI): void {
 
 		const assistantEvent = event.assistantMessageEvent;
 		if (!assistantEvent) return;
+		const c = palette();
 
 		if (assistantEvent.type === "thinking_start") {
+			if (opts.has("status")) writeStatus("thinking started");
 			if (opts.has("thinking")) {
 				inThinkingBlock = true;
-				process.stderr.write(`${colors.gray}[thinking] `);
+				writeOutput(`${c.gray}[thinking] `);
 			}
 		} else if (assistantEvent.type === "thinking_delta") {
-			if (inThinkingBlock) {
-				process.stderr.write(assistantEvent.delta);
-			}
+			thinkingChars += assistantEvent.delta.length;
+			maybeWriteCountStatus("thinking");
+			if (inThinkingBlock) writeOutput(assistantEvent.delta);
 		} else if (assistantEvent.type === "thinking_end") {
+			if (opts.has("status")) writeStatus(`thinking finished: ${thinkingChars} chars`);
 			if (inThinkingBlock) {
 				inThinkingBlock = false;
-				process.stderr.write(`${colors.reset}\n\n`);
+				writeOutput(`${c.reset}\n\n`);
 			}
 		} else if (assistantEvent.type === "text_start") {
+			if (opts.has("status")) writeStatus("message started");
 			if (opts.has("message")) {
 				inTextBlock = true;
-				streamedText = "";
 				textLines = 1;
-				process.stderr.write(`${colors.cyan}[text] `);
+				textChars = 0;
+				lastStatusTextChars = 0;
+				writeOutput(`${c.cyan}[text] `);
 			}
 		} else if (assistantEvent.type === "text_delta") {
+			textChars += assistantEvent.delta.length;
+			maybeWriteCountStatus("message");
 			if (inTextBlock) {
-				process.stderr.write(assistantEvent.delta);
-				streamedText += assistantEvent.delta;
+				writeOutput(assistantEvent.delta);
 				textLines += (assistantEvent.delta.match(/\n/g) || []).length;
 			}
 		} else if (assistantEvent.type === "text_end") {
+			if (opts.has("status")) writeStatus(`message finished: ${textChars} chars`);
 			if (inTextBlock) {
 				inTextBlock = false;
-				process.stderr.write(`${colors.reset}\n\n`);
+				writeOutput(`${c.reset}\n\n`);
 			}
 		}
 	});
@@ -248,41 +676,46 @@ export default function streamOutputExtension(pi: ExtensionAPI): void {
 	// [calling] — concise, tool-specific args
 	pi.on("tool_execution_start", async (event) => {
 		const opts = getStreamOptions();
+		if (opts.has("status")) writeStatus(`tool started: ${event.toolName}`);
 		if (!opts.has("tools")) return;
+
+		const c = palette();
 		hasRunningLine = false;
 		const argsDisplay = formatToolArgs(event.toolName, event.args);
-		process.stderr.write(
-			`${colors.yellow}[tool] [calling] ${event.toolName}${colors.reset}\n` +
-			`${colors.yellow}        ${indentContent(argsDisplay, 8)}${colors.reset}\n`,
+		writeOutput(
+			`${c.yellow}[tool] [calling] ${event.toolName}${c.reset}\n` +
+			`${c.yellow}        ${indentContent(argsDisplay, 8)}${c.reset}\n`,
 		);
 	});
 
 	// [running] — compact progress indicator, overwrites itself to avoid spam
 	pi.on("tool_execution_update", async (event) => {
 		const opts = getStreamOptions();
-		if (!opts.has("tools")) return;
 		if (!event.partialResult) return;
 
 		const text = extractText(event.partialResult);
 		const bytes = text !== null ? text.length : JSON.stringify(event.partialResult).length;
 		const sizeStr = formatBytes(bytes);
+		if (opts.has("status")) writeStatus(`tool running: ${event.toolName} (${sizeStr})`);
+		if (!opts.has("tools")) return;
 
-		// Overwrite previous running line if one exists
-		if (hasRunningLine) {
-			process.stderr.write("\x1b[1A\x1b[2K\r");
+		const c = palette();
+		if (hasRunningLine && useAnsi()) {
+			writeOutput("\x1b[1A\x1b[2K\r");
 		}
-		process.stderr.write(`${colors.yellow}[tool] [running] ${event.toolName} → ${sizeStr}${colors.reset}\n`);
+		writeOutput(`${c.yellow}[tool] [running] ${event.toolName} → ${sizeStr}${c.reset}\n`);
 		hasRunningLine = true;
 	});
 
 	// [result] / [error] — formatted output with real newlines
 	pi.on("tool_execution_end", async (event) => {
 		const opts = getStreamOptions();
+		if (opts.has("status")) writeStatus(`tool ${event.isError ? "failed" : "finished"}: ${event.toolName}`);
 		if (!opts.has("tools")) return;
 
-		// Clear any [running] line before showing result
-		if (hasRunningLine) {
-			process.stderr.write("\x1b[1A\x1b[2K\r");
+		const c = palette();
+		if (hasRunningLine && useAnsi()) {
+			writeOutput("\x1b[1A\x1b[2K\r");
 			hasRunningLine = false;
 		}
 
@@ -290,25 +723,26 @@ export default function streamOutputExtension(pi: ExtensionAPI): void {
 		const indented = indentContent(resultDisplay, 8);
 
 		if (event.isError) {
-			process.stderr.write(
-				`${colors.red}[tool] [error] ${event.toolName}${colors.reset}\n` +
-				`${colors.red}        ${indentContent(resultDisplay, 8)}${colors.reset}\n\n`,
+			writeOutput(
+				`${c.red}[tool] [error] ${event.toolName}${c.reset}\n` +
+				`${c.red}        ${indentContent(resultDisplay, 8)}${c.reset}\n\n`,
 			);
 		} else {
-			process.stderr.write(
-				`${colors.yellow}[tool] [result] ${event.toolName}${colors.reset}\n` +
-				`${colors.yellow}        ${indented}${colors.reset}\n\n`,
+			writeOutput(
+				`${c.yellow}[tool] [result] ${event.toolName}${c.reset}\n` +
+				`${c.yellow}        ${indented}${c.reset}\n\n`,
 			);
 		}
 	});
 
-	pi.on("agent_end", async () => {
+	pi.on("agent_end", async (event) => {
+		writeUsageOutput(event);
 		const opts = getStreamOptions();
-		if (opts.size === 0) return;
-		if (textLines <= 0) return;
-
-		// In a real terminal, these ANSI codes would clear the duplicate output
-		// Move cursor up N lines, then clear from cursor to end of screen
-		process.stdout.write(`\x1b[${textLines}A\x1b[0J`);
+		if (opts.has("status")) writeStatus(`agent finished: ${textChars} message chars, ${thinkingChars} thinking chars`);
+		if (opts.size > 0 && textLines > 0 && useAnsi()) {
+			// In a real terminal, these ANSI codes clear the duplicate final output.
+			writeOutput(`\x1b[${textLines}A\x1b[0J`);
+		}
+		closeOutputFile();
 	});
 }
